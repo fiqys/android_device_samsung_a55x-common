@@ -113,7 +113,9 @@ PRODUCT_PACKAGES += \
     fsck.f2fs.vendor_ramdisk
 
 # Fingerprint
-PRODUCT_PACKAGES += android.hardware.biometrics.fingerprint-service.s5e8845
+PRODUCT_PACKAGES += \
+    android.hardware.biometrics.fingerprint-service.s5e8845 \
+    SamsungBiometrics
 
 # Vibrator
 PRODUCT_PACKAGES += android.hardware.vibrator-service.s5e8845
