@@ -20,6 +20,16 @@
 #include <string>
 #include <thread>
 
+// Unix socket bridge to the Java biometrics service
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <poll.h>
+
 using namespace ::android::fingerprint::samsung;
 using namespace ::std::chrono_literals;
 
@@ -28,6 +38,131 @@ namespace android {
 namespace hardware {
 namespace biometrics {
 namespace fingerprint {
+
+static int readNormalBrightness() {
+    static const char* kPaths[] = {
+        "/sys/class/lcd/panel/device/backlight/panel/brightness",
+        "/sys/class/backlight/panel0-backlight/brightness",
+        nullptr
+    };
+    for (int i = 0; kPaths[i] != nullptr; ++i) {
+        std::ifstream f(kPaths[i]);
+        if (!f.is_open()) continue;
+        int val = -1;
+        f >> val;
+        if (!f.fail() && val >= 0) {
+            LOG(INFO) << "readNormalBrightness: " << val << " from " << kPaths[i];
+            return val;
+        }
+    }
+    LOG(WARNING) << "readNormalBrightness: could not read from any known path";
+    return -1;
+}
+static void notifyBiometricsService(const std::string& msg) {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOG(WARNING) << "notifyBiometricsService: socket() failed for msg=" << msg;
+        return;
+    }
+
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    // Abstract namespace: sun_path[0] == '\0', rest is the name
+    addr.sun_path[0] = '\0';
+    const char* name = "udfps_bridge";
+    ::strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
+    socklen_t addrLen =
+            static_cast<socklen_t>(sizeof(sa_family_t) + 1 + ::strlen(name));
+
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addrLen) < 0) {
+        // Service not ready yet — not an error
+        LOG(WARNING) << "notifyBiometricsService: connect() failed (service not ready?) "
+                     << "msg=" << msg;
+        ::close(fd);
+        return;
+    }
+
+    ssize_t sent = ::send(fd, msg.c_str(), msg.size(), 0);
+    if (sent < 0) {
+        LOG(WARNING) << "notifyBiometricsService: send() failed for msg=" << msg;
+    } else {
+        LOG(INFO) << "notifyBiometricsService: sent \"" << msg << "\" (" << sent << " bytes)";
+    }
+    ::close(fd);
+}
+
+static bool notifyBiometricsServiceAndWait(const std::string& msg,
+                                           const std::string& expected,
+                                           int timeoutMs) {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOG(WARNING) << "notifyBiometricsServiceAndWait: socket() failed for msg=" << msg;
+        return false;
+    }
+
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    const char* name = "udfps_bridge";
+    ::strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
+    socklen_t addrLen =
+            static_cast<socklen_t>(sizeof(sa_family_t) + 1 + ::strlen(name));
+
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addrLen) < 0) {
+        LOG(WARNING) << "notifyBiometricsServiceAndWait: connect() failed (service not ready?) "
+                     << "msg=" << msg;
+        ::close(fd);
+        return false;
+    }
+
+    ssize_t sent = ::send(fd, msg.c_str(), msg.size(), 0);
+    if (sent < 0) {
+        LOG(WARNING) << "notifyBiometricsServiceAndWait: send() failed for msg=" << msg;
+        ::close(fd);
+        return false;
+    }
+
+    struct pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+
+    int pollRc = ::poll(&pfd, 1, timeoutMs);
+    if (pollRc <= 0) {
+        if (pollRc == 0) {
+            LOG(WARNING) << "notifyBiometricsServiceAndWait: timed out waiting for reply to "
+                         << msg;
+        } else {
+            LOG(WARNING) << "notifyBiometricsServiceAndWait: poll() failed for msg=" << msg
+                         << " errno=" << errno;
+        }
+        ::close(fd);
+        return false;
+    }
+
+    char buf[64] = {};
+    ssize_t len = ::recv(fd, buf, sizeof(buf) - 1, 0);
+    if (len <= 0) {
+        LOG(WARNING) << "notifyBiometricsServiceAndWait: recv() failed/empty for msg=" << msg;
+        ::close(fd);
+        return false;
+    }
+
+    std::string reply(buf, static_cast<size_t>(len));
+    while (!reply.empty() &&
+           (reply.back() == '\n' || reply.back() == '\r' || reply.back() == ' ')) {
+        reply.pop_back();
+    }
+    ::close(fd);
+
+    if (reply != expected) {
+        LOG(WARNING) << "notifyBiometricsServiceAndWait: unexpected reply \"" << reply
+                     << "\" for msg=" << msg << " expected=\"" << expected << "\"";
+        return false;
+    }
+
+    LOG(INFO) << "notifyBiometricsServiceAndWait: reply \"" << reply << "\" for msg=" << msg;
+    return true;
+}
 
 void onClientDeath(void* cookie) {
     LOG(INFO) << "FingerprintService has died";
@@ -220,18 +355,24 @@ ndk::ScopedAStatus Session::onPointerDown(int32_t /*pointerId*/, int32_t /*x*/, 
 
     std::string sensorTypeProp = FingerprintHalProperties::type().value_or("");
     if (sensorTypeProp == "udfps_optical") {
-        mBrightnessRestore =
-                std::make_unique<TimedRestore>("/sys/class/backlight/panel/brightness");
-
-        int currentBrightness = 0;
-        {
-            std::ifstream infile("/sys/class/backlight/panel/brightness");
-            if (infile.is_open()) {
-                infile >> currentBrightness;
-            }
+        int normalBrightness = readNormalBrightness();
+        bool maskReady = notifyBiometricsServiceAndWait(
+                "finger_down:" + std::to_string(normalBrightness),
+                "mask_ready",
+                150 /* timeoutMs */);
+        if (!maskReady) {
+            LOG(WARNING) << "onPointerDown: mask_ready handshake timed out; proceeding with HBM";
         }
 
-        mBrightnessRestore->set(std::max(currentBrightness, 200));
+        {
+            std::ofstream hbmFile("/sys/class/lcd/panel/mask_brightness");
+            if (hbmFile.is_open()) {
+                hbmFile << "319";
+                LOG(INFO) << "onPointerDown: wrote 319 to mask_brightness";
+            } else {
+                LOG(ERROR) << "onPointerDown: failed to open mask_brightness";
+            }
+        }
     }
 
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
@@ -247,7 +388,23 @@ ndk::ScopedAStatus Session::onPointerUp(int32_t /*pointerId*/) {
 
     std::string sensorTypeProp = FingerprintHalProperties::type().value_or("");
     if (sensorTypeProp == "udfps_optical") {
-        mBrightnessRestore.reset();
+        bool overlayHidden = notifyBiometricsServiceAndWait(
+                "finger_up",
+                "overlay_hidden",
+                150 /* timeoutMs */);
+        if (!overlayHidden) {
+            LOG(WARNING) << "onPointerUp: overlay_hidden handshake timed out; disabling HBM anyway";
+        }
+
+        {
+            std::ofstream hbmFile("/sys/class/lcd/panel/mask_brightness");
+            if (hbmFile.is_open()) {
+                hbmFile << "0";
+                LOG(INFO) << "onPointerUp: wrote 0 to mask_brightness";
+            } else {
+                LOG(ERROR) << "onPointerUp: failed to open mask_brightness";
+            }
+        }
     }
 
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
@@ -316,12 +473,20 @@ ndk::ScopedAStatus Session::cancel() {
 
     std::string sensorTypeProp = FingerprintHalProperties::type().value_or("");
     if (sensorTypeProp == "udfps_optical") {
+        bool overlayHidden = notifyBiometricsServiceAndWait(
+                "finger_up", "overlay_hidden", 150 /* timeoutMs */);
+        if (!overlayHidden) {
+            LOG(WARNING) << "cancel: overlay_hidden timed out";
+        }
+        {
+            std::ofstream hbmFile("/sys/class/lcd/panel/mask_brightness");
+            if (hbmFile.is_open()) hbmFile << "0";
+        }
         mBrightnessRestore.reset();
     }
 
     if (ret == 0) {
         mCb->onError(Error::CANCELED, 0 /* vendorCode */);
-
         return ndk::ScopedAStatus::ok();
     } else {
         return ndk::ScopedAStatus::fromServiceSpecificError(ret);
@@ -447,6 +612,15 @@ void Session::notify(const fingerprint_msg_t* msg) {
 
             std::string sensorTypeProp = FingerprintHalProperties::type().value_or("");
             if (sensorTypeProp == "udfps_optical") {
+                bool overlayHidden = notifyBiometricsServiceAndWait(
+                        "finger_up", "overlay_hidden", 150 /* timeoutMs */);
+                if (!overlayHidden) {
+                    LOG(WARNING) << "FINGERPRINT_ERROR: overlay_hidden timed out";
+                }
+                {
+                    std::ofstream hbmFile("/sys/class/lcd/panel/mask_brightness");
+                    if (hbmFile.is_open()) hbmFile << "0";
+                }
                 mBrightnessRestore.reset();
             }
 
@@ -495,7 +669,17 @@ void Session::notify(const fingerprint_msg_t* msg) {
 
                 std::string sensorTypeProp = FingerprintHalProperties::type().value_or("");
                 if (sensorTypeProp == "udfps_optical") {
-                    mBrightnessRestore.reset();
+                    bool overlayHidden = notifyBiometricsServiceAndWait(
+                            "finger_up", "overlay_hidden", 150 /* timeoutMs */);
+                    if (!overlayHidden) {
+                        LOG(WARNING) << "FINGERPRINT_AUTHENTICATED: overlay_hidden timed out";
+                    }
+                    std::ofstream hbmFile("/sys/class/lcd/panel/mask_brightness");
+                    if (hbmFile.is_open()) {
+                        hbmFile << "0";
+                    } else {
+                        LOG(ERROR) << "Failed to write 0 to mask_brightness on auth success";
+                    }
                 }
 
                 mCb->onAuthenticationSucceeded(msg->data.authenticated.finger.fid, authToken);
